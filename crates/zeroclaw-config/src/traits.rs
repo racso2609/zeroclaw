@@ -82,6 +82,13 @@ pub enum PropKind {
     StringArray,
     ObjectArray,
     Object,
+    /// Container row for a `#[secret] HashMap<String, String>` field (MCP
+    /// `env`/`headers`, provider `extra_headers`, …). The row exists so
+    /// surfaces can offer "add key" even when the map is empty; its display
+    /// value lists key names only, never values. Individual entries are the
+    /// `<path>.<KEY>` rows: set one to add/replace it, set it to the empty
+    /// string (`config delete`) to remove it.
+    SecretMap,
 }
 
 /// Maps Rust types to PropKind at compile time.
@@ -241,9 +248,6 @@ impl HasPropKind for crate::schema::DelegateExecutionMode {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
 impl HasPropKind for Vec<crate::schema::DelegateTargetConfig> {
-    const PROP_KIND: PropKind = PropKind::ObjectArray;
-}
-impl HasPropKind for Vec<crate::schema::NevisRoleMappingConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 impl HasPropKind for Vec<crate::schema::PeripheralBoardConfig> {
@@ -408,6 +412,7 @@ impl PropKind {
             Self::StringArray => "string_array",
             Self::ObjectArray => "object_array",
             Self::Object => "object",
+            Self::SecretMap => "secret_map",
         }
     }
 }

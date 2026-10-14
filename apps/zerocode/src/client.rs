@@ -282,9 +282,12 @@ pub enum SessionUpdate {
     /// `max_context_tokens` is the preemptive-trim budget the bar fills toward;
     /// `model_context_window` is the model's full capacity, used as the bar
     /// denominator when present so the trim budget can be drawn as a marker.
+    /// `input_tokens_source` is the provenance of `input_tokens` ("provider" or
+    /// "estimate"); an estimated count must be rendered as approximate.
     ContextUsage {
         session_id: String,
         input_tokens: Option<u64>,
+        input_tokens_source: Option<String>,
         max_context_tokens: Option<u64>,
         model_context_window: Option<u64>,
     },
@@ -292,6 +295,7 @@ pub enum SessionUpdate {
     HistoryTrimmed {
         session_id: String,
         dropped_messages: u64,
+        dropped_turns: Option<u64>,
         kept_turns: u64,
         reason: String,
         /// Configured context token budget, when the trim was token-budget
@@ -400,12 +404,17 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
         "context_usage" => Some(SessionUpdate::ContextUsage {
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
+            input_tokens_source: params
+                .get("input_tokens_source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
             model_context_window: params.get("model_context_window").and_then(|v| v.as_u64()),
         }),
         "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
             session_id: sid,
             dropped_messages: params.get("dropped_messages")?.as_u64()?,
+            dropped_turns: params.get("dropped_turns").and_then(|v| v.as_u64()),
             kept_turns: params.get("kept_turns")?.as_u64()?,
             reason: params.get("reason")?.as_str()?.to_string(),
             token_budget: params.get("token_budget").and_then(|v| v.as_u64()),
@@ -582,6 +591,35 @@ impl fmt::Display for DaemonInitializeTimeout {
 }
 
 impl std::error::Error for DaemonInitializeTimeout {}
+
+/// A single RPC did not get a reply within its client-side deadline. The
+/// connection is still up; the daemon is busy or wedged on this method.
+/// Callers that own a UI surface should report this and stay alive — a
+/// stalled `config/list` is not a reason to exit the TUI.
+#[derive(Debug)]
+pub struct DaemonRpcTimeout {
+    pub method: String,
+    pub timeout: Duration,
+}
+
+impl DaemonRpcTimeout {
+    pub fn from_anyhow(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+}
+
+impl fmt::Display for DaemonRpcTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RPC {}: timed out after {}s",
+            self.method,
+            self.timeout.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for DaemonRpcTimeout {}
 
 #[derive(Debug)]
 pub(crate) struct InitializeResponse {
@@ -2103,7 +2141,10 @@ impl RpcClient {
     /// Build a rustls `ClientConfig` from a [`ClientTls`]: server verification via
     /// the configured CA (or `NoVerify` when `skip_verify`), presenting the client
     /// certificate for mutual TLS when one is configured.
-    fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    ///
+    /// Crate-visible because the gateway enrollment leg that precedes the WSS
+    /// connection must be given exactly the same trust material.
+    pub(crate) fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
         use std::sync::Arc;
 
         let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -2167,10 +2208,10 @@ impl RpcClient {
         let result = tokio::time::timeout(timeout, self.rpc.request(method, params))
             .await
             .map_err(|_| {
-                anyhow::Error::msg(format!(
-                    "RPC {method}: timed out after {}s",
-                    timeout.as_secs()
-                ))
+                anyhow::Error::new(DaemonRpcTimeout {
+                    method: method.to_string(),
+                    timeout,
+                })
             })?
             .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
@@ -6303,10 +6344,52 @@ mod notification_tests {
             parse_session_update(&params),
             Some(SessionUpdate::ContextUsage {
                 session_id,
+                input_tokens_source: None,
                 input_tokens: Some(100_000),
                 max_context_tokens: Some(180_000),
                 model_context_window: Some(200_000),
             }) if session_id == "s-context"
+        ));
+    }
+
+    #[test]
+    fn parse_context_usage_decodes_the_estimate_provenance_marker() {
+        let params = serde_json::json!({
+            "type": "context_usage",
+            "session_id": "s-context",
+            "input_tokens": 4_200,
+            "input_tokens_source": "estimate",
+            "max_context_tokens": 180_000,
+            "model_context_window": 200_000
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::ContextUsage {
+                input_tokens: Some(4_200),
+                ref input_tokens_source,
+                ..
+            }) if input_tokens_source.as_deref() == Some("estimate")
+        ));
+    }
+
+    #[test]
+    fn parse_context_usage_decodes_the_provider_provenance_marker() {
+        let params = serde_json::json!({
+            "type": "context_usage",
+            "session_id": "s-context",
+            "input_tokens": 100_000,
+            "input_tokens_source": "provider",
+            "max_context_tokens": 180_000,
+            "model_context_window": 200_000
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::ContextUsage {
+                ref input_tokens_source,
+                ..
+            }) if input_tokens_source.as_deref() == Some("provider")
         ));
     }
 
@@ -6535,6 +6618,7 @@ mod plan_parse_tests {
             "type": "history_trimmed",
             "session_id": "sess-3",
             "dropped_messages": 12,
+            "dropped_turns": 4,
             "kept_turns": 3,
             "reason": "history message limit exceeded"
         });
@@ -6544,6 +6628,7 @@ mod plan_parse_tests {
             Some(SessionUpdate::HistoryTrimmed {
                 session_id,
                 dropped_messages: 12,
+                dropped_turns: Some(4),
                 kept_turns: 3,
                 reason,
                 token_budget: None,
@@ -6553,6 +6638,25 @@ mod plan_parse_tests {
                 tokens_after_source: None,
                 unsatisfiable_floor: None,
             }) if session_id == "sess-3" && reason == "history message limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn parses_legacy_history_trimmed_update_without_dropped_turns() {
+        let params = serde_json::json!({
+            "type": "history_trimmed",
+            "session_id": "sess-3",
+            "dropped_messages": 12,
+            "kept_turns": 3,
+            "reason": "history message limit exceeded"
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::HistoryTrimmed {
+                dropped_turns: None,
+                ..
+            })
         ));
     }
 
@@ -6576,6 +6680,7 @@ mod plan_parse_tests {
             Some(SessionUpdate::HistoryTrimmed {
                 session_id,
                 dropped_messages: 12,
+                dropped_turns: None,
                 kept_turns: 33,
                 reason,
                 token_budget: Some(500000),

@@ -11,6 +11,7 @@ use crossterm::{
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
+    style::Print,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
@@ -33,6 +34,12 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
 }
 
+/// Ask terminals implementing XTSHIFTESCAPE to report Shift-modified mouse
+/// events to the application instead of reserving Shift for local selection.
+pub(crate) fn mouse_shift_capture_sequence(capture: bool) -> &'static str {
+    if capture { "\x1b[>1s" } else { "\x1b[>0s" }
+}
+
 fn type_template_label(template: &ConfigTemplateEntry) -> String {
     template
         .path
@@ -48,6 +55,18 @@ fn is_direct_child_path(path: &str, prefix: &str) -> bool {
         .is_some_and(|relative| !relative.is_empty() && !relative.contains('.'))
 }
 
+fn model_field_catalog_reference(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split('.').collect();
+    match segments.as_slice() {
+        ["providers", "models", family, alias, "model"]
+            if !family.is_empty() && !alias.is_empty() =>
+        {
+            Some(format!("{family}.{alias}"))
+        }
+        _ => None,
+    }
+}
+
 fn retain_direct_children(fields: &mut Vec<ConfigFieldEntry>, prefix: &str) {
     fields.retain(|field| is_direct_child_path(&field.path, prefix));
 }
@@ -59,6 +78,7 @@ pub(crate) fn init_terminal() -> Result<Term> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
+        Print(mouse_shift_capture_sequence(true)),
         EnableBracketedPaste,
     )?;
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
@@ -82,6 +102,7 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     execute!(
         term.backend_mut(),
         DisableBracketedPaste,
+        Print(mouse_shift_capture_sequence(false)),
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -212,6 +233,23 @@ fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static 
             .err()
             .map(|_| "zc-config-status-invalid-float"),
         _ => None,
+    }
+}
+
+/// Validate a new secret-map entry key (env var name, header name, …).
+/// Returns the Fluent key of the rejection message, or `None` when valid.
+/// Kept deliberately loose: the same row type fronts env vars, HTTP headers,
+/// and plugin settings, so only what can never be a valid key is refused.
+fn secret_map_key_validation_key(key: &str) -> Option<&'static str> {
+    if key.is_empty() {
+        Some("zc-config-secret-map-key-empty")
+    } else if key
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '=')
+    {
+        Some("zc-config-secret-map-key-invalid")
+    } else {
+        None
     }
 }
 
@@ -409,6 +447,9 @@ pub(crate) struct App {
     // Edit state
     edit_buf: String,
     edit_cursor: usize,
+    /// Two-step add on a `PropKind::SecretMap` row: `None` while the user
+    /// types the entry key, `Some(key)` while they type its (masked) value.
+    secret_map_entry_key: Option<String>,
     // Enum/bool select state
     select_cursor: usize,
     select_items: Vec<String>,
@@ -482,6 +523,7 @@ impl App {
             field_cursor: 0,
             edit_buf: String::new(),
             edit_cursor: 0,
+            secret_map_entry_key: None,
             select_cursor: 0,
             select_items: Vec::new(),
             status_msg: None,
@@ -771,6 +813,38 @@ impl App {
     /// Handle a key event. Returns `Ok(true)` when the user wants to
     /// quit the entire TUI (never triggered from Config; use Ctrl+C at the app level).
     pub(crate) async fn handle_key(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
+        let result = self.handle_key_inner(key, term).await;
+        self.settle_handler_result(result, false)
+    }
+
+    /// Shared exit path of `handle_key` / `handle_mouse`: an RPC timeout is
+    /// absorbed into the status line and replaced by `absorbed` (for keys,
+    /// `false` = do not quit); every other result passes through unchanged.
+    fn settle_handler_result<T>(&mut self, result: Result<T>, absorbed: T) -> Result<T> {
+        match result {
+            Err(error) if self.absorb_rpc_timeout(&error) => Ok(absorbed),
+            other => other,
+        }
+    }
+
+    /// A per-call RPC deadline (`DaemonRpcTimeout`) means the daemon is busy
+    /// on that one method, not that the connection is gone. Surfacing it as
+    /// a status line keeps the TUI alive; letting it unwind through
+    /// `app::run` used to exit the whole process (observed on `config/list`
+    /// while a route-affecting `config/set` was queued behind a running
+    /// turn). Returns `true` when the error was absorbed.
+    fn absorb_rpc_timeout(&mut self, error: &anyhow::Error) -> bool {
+        if crate::client::DaemonRpcTimeout::from_anyhow(error).is_none() {
+            return false;
+        }
+        self.status_msg = Some(crate::i18n::t_args(
+            "zc-config-status-load-failed",
+            &[("err", &format!("{error:#}"))],
+        ));
+        true
+    }
+
+    async fn handle_key_inner(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
         self.status_msg = None;
 
         // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
@@ -853,6 +927,16 @@ impl App {
 
     /// Handle a mouse event forwarded from the app event loop.
     pub(crate) async fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        area: Rect,
+        term: &mut Term,
+    ) -> Result<()> {
+        let result = self.handle_mouse_inner(mouse, area, term).await;
+        self.settle_handler_result(result, ())
+    }
+
+    async fn handle_mouse_inner(
         &mut self,
         mouse: MouseEvent,
         _area: Rect,
@@ -2473,6 +2557,16 @@ impl App {
             Some(ConfigTabAction::Enter) if visible.contains(&self.field_cursor) => {
                 self.enter_field_edit(self.field_cursor, term).await;
             }
+            Some(ConfigTabAction::DeleteRow)
+                if self
+                    .fields
+                    .get(self.field_cursor)
+                    .is_some_and(|field| field.kind == PropKind::SecretMap) =>
+            {
+                // The container row is not itself a value; entries are
+                // removed from their own `<path>.<KEY>` rows.
+                self.status_msg = Some(crate::i18n::t("zc-config-secret-map-delete-hint"));
+            }
             Some(ConfigTabAction::DeleteRow) => {
                 if let Some(field) = self.fields.get(self.field_cursor) {
                     let prop = field.path.clone();
@@ -2505,6 +2599,33 @@ impl App {
     }
 
     // ── Composite tab helpers ──────────────────────────────────────
+
+    /// Drop the cached composite-tab data for a section prefix, without
+    /// issuing any request. A save inside a composite section can retarget
+    /// the data its Skills or Personality tab shows (a bundle's directory,
+    /// an agent's workspace.path); clearing the cached list lets
+    /// on_tab_switched refetch it on the next tab entry, so no request is
+    /// issued unless the user goes there. Invalidate on every successful
+    /// save in the section rather than only when the saved field is the
+    /// retargeting one: a field-name check is brittle, and the cost of a
+    /// wrong guess is one lazy list request.
+    fn invalidate_composite_state(&mut self, prefix: &str) {
+        if prefix.starts_with("agents.") {
+            self.personality_files.clear();
+            self.personality_active_file = None;
+            self.personality_cursor = 0;
+            self.personality_content.clear();
+            self.personality_loaded.clear();
+        } else if prefix.starts_with("skill-bundles.") {
+            self.skills_list.clear();
+            self.skills_active = None;
+            self.skills_cursor = 0;
+            self.skills_body.clear();
+            self.skills_body_loaded.clear();
+            self.skills_frontmatter = Default::default();
+            self.skills_frontmatter_loaded = Default::default();
+        }
+    }
 
     /// Called after ←/→ tab switch — loads data for composite tabs.
     async fn on_tab_switched(&mut self, term: &mut Term) -> Result<()> {
@@ -3027,36 +3148,34 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if field_path.ends_with(".model") && field_path.starts_with("providers.models.") {
-            // providers.models.<family>.<alias>.model → segment at index 2
-            let segments: Vec<&str> = field_path.split('.').collect();
-            if segments.len() >= 4 {
-                let family = segments[2].to_string();
+        if let Some(provider_ref) = model_field_catalog_reference(&field_path) {
+            let family = provider_ref
+                .split_once('.')
+                .map_or(provider_ref.as_str(), |(family, _)| family)
+                .to_string();
 
-                // Show loading indicator before the blocking RPC call.
-                self.status_msg = Some(crate::i18n::t_args(
-                    "zc-config-status-fetching-models",
-                    &[("family", &family)],
-                ));
-                let _ = self.draw(term);
+            // Show loading indicator before the blocking RPC call.
+            self.status_msg = Some(crate::i18n::t_args(
+                "zc-config-status-fetching-models",
+                &[("family", &family)],
+            ));
+            let _ = self.draw(term);
 
-                match self.rpc.catalog_models(&family).await {
-                    Ok(res) if !res.models.is_empty() => {
-                        self.select_cursor = res
-                            .models
-                            .iter()
-                            .position(|m| m == &field_current)
-                            .unwrap_or(0);
-                        self.select_items = res.models;
-                        self.status_msg = None;
-                    }
-                    Ok(_) => {
-                        self.status_msg = Some(crate::i18n::t("zc-config-status-no-models"));
-                    }
-                    Err(_) => {
-                        self.status_msg =
-                            Some(crate::i18n::t("zc-config-status-model-fetch-failed"));
-                    }
+            match self.rpc.catalog_models(&provider_ref).await {
+                Ok(res) if !res.models.is_empty() => {
+                    self.select_cursor = res
+                        .models
+                        .iter()
+                        .position(|m| m == &field_current)
+                        .unwrap_or(0);
+                    self.select_items = res.models;
+                    self.status_msg = None;
+                }
+                Ok(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-no-models"));
+                }
+                Err(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-model-fetch-failed"));
                 }
             }
         }
@@ -3100,6 +3219,7 @@ impl App {
 
     fn prepare_edit_at(&mut self, idx: usize) {
         let kind = self.fields[idx].kind;
+        self.secret_map_entry_key = None;
         let value = if self.fields[idx].populated {
             self.fields[idx]
                 .value
@@ -3269,6 +3389,50 @@ impl App {
         };
     }
 
+    /// Advance the two-step "add entry" flow on a `PropKind::SecretMap`
+    /// row. Step 1 takes the entry key; step 2 takes its value and writes
+    /// `<map_path>.<key>`. An existing key is simply replaced. Empty values
+    /// are refused here because the daemon treats "" as "remove entry".
+    async fn confirm_secret_map_step(&mut self, map_path: &str) -> Result<()> {
+        let Some(key) = self.secret_map_entry_key.clone() else {
+            let key = self.edit_buf.trim().to_string();
+            if let Some(status_key) = secret_map_key_validation_key(&key) {
+                self.status_msg = Some(crate::i18n::t(status_key));
+                return Ok(());
+            }
+            self.secret_map_entry_key = Some(key);
+            self.edit_buf.clear();
+            self.edit_cursor = 0;
+            self.status_msg = None;
+            return Ok(());
+        };
+        if self.edit_buf.is_empty() {
+            self.status_msg = Some(crate::i18n::t("zc-config-secret-map-value-empty"));
+            return Ok(());
+        }
+        let prop = format!("{map_path}.{key}");
+        let value = serde_json::Value::String(self.edit_buf.clone());
+        match self.rpc.config_set(&prop, value).await {
+            Ok(()) => {
+                self.secret_map_entry_key = None;
+                self.edit_buf.clear();
+                self.edit_cursor = 0;
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-field-set",
+                    &[("prop", &prop)],
+                ));
+                self.pop_to_field_list_keep_cursor().await?;
+            }
+            Err(e) => {
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-set-failed",
+                    &[("err", &e.to_string())],
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn is_scalar_field_edit(&self) -> bool {
         matches!(&self.screen, Screen::FieldEdit { field_idx, .. }
             if !self.is_select_edit()
@@ -3298,12 +3462,8 @@ impl App {
                     self.edit_buf.pop();
                 }
                 Some(ConfigEditorAction::Save) => {
-                    if let Screen::FieldEdit {
-                        prefix, field_idx, ..
-                    } = &self.screen
-                    {
+                    if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                         let prop = self.fields[*field_idx].path.clone();
-                        let prefix = prefix.clone();
                         let entries: Vec<String> = self
                             .edit_buf
                             .lines()
@@ -3320,7 +3480,6 @@ impl App {
                                     "zc-config-status-field-set",
                                     &[("prop", &prop)],
                                 ));
-                                self.load_fields(&prefix).await?;
                                 self.pop_to_field_list_keep_cursor().await?;
                             }
                             Err(e) => {
@@ -3349,10 +3508,13 @@ impl App {
                 self.pop_to_field_list().await?;
             }
             Some(ConfigEditorAction::Confirm) => {
-                if let Screen::FieldEdit {
-                    prefix, field_idx, ..
-                } = &self.screen
+                if let Screen::FieldEdit { field_idx, .. } = &self.screen
+                    && self.fields[*field_idx].kind == PropKind::SecretMap
                 {
+                    let map_path = self.fields[*field_idx].path.clone();
+                    return self.confirm_secret_map_step(&map_path).await;
+                }
+                if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                     let field = &self.fields[*field_idx];
                     if let Some(status) =
                         scalar_validation_status(field.kind, &self.edit_buf, &field.path)
@@ -3362,14 +3524,12 @@ impl App {
                     }
                     let prop = field.path.clone();
                     let value = serde_json::Value::String(self.edit_buf.clone());
-                    let prefix = prefix.clone();
                     match self.rpc.config_set(&prop, value).await {
                         Ok(()) => {
                             self.status_msg = Some(crate::i18n::t_args(
                                 "zc-config-status-field-set",
                                 &[("prop", &prop)],
                             ));
-                            self.load_fields(&prefix).await?;
                             self.pop_to_field_list_keep_cursor().await?;
                         }
                         Err(e) => {
@@ -3447,20 +3607,16 @@ impl App {
 
     async fn commit_select(&mut self, orig_idx: usize) -> Result<()> {
         if let Some(chosen) = self.select_items.get(orig_idx)
-            && let Screen::FieldEdit {
-                prefix, field_idx, ..
-            } = &self.screen
+            && let Screen::FieldEdit { field_idx, .. } = &self.screen
         {
             let prop = self.fields[*field_idx].path.clone();
             let value = serde_json::Value::String(chosen.clone());
-            let prefix = prefix.clone();
             match self.rpc.config_set(&prop, value).await {
                 Ok(()) => {
                     self.status_msg = Some(crate::i18n::t_args(
                         "zc-config-status-field-set",
                         &[("prop", &prop)],
                     ));
-                    self.load_fields(&prefix).await?;
                     self.pop_to_field_list_keep_cursor().await?;
                 }
                 Err(e) => {
@@ -3501,8 +3657,13 @@ impl App {
             field_idx,
         } = std::mem::replace(&mut self.screen, Screen::SectionList)
         {
-            // Silent refresh — preserves cursor below.
+            // This silent reload is the only refresh after a successful save.
+            // Callers must not run load_fields() first: it resets active_tab
+            // and the composite-tab state and issues a second config/list.
+            // The composite-tab state is invalidated right after it for the
+            // same reason: the removed load_fields() call used to clear it.
             self.reload_fields_silent(&prefix).await;
+            self.invalidate_composite_state(&prefix);
             self.field_cursor = field_idx.min(self.fields.len().saturating_sub(1));
             self.screen = Screen::FieldList {
                 section_idx,
@@ -4005,7 +4166,11 @@ impl App {
                 let f = &self.fields[i];
                 let short_name =
                     &tab_names[tab_indices.iter().position(|&ti| ti == i).unwrap_or(0)];
-                let val_display = if f.is_secret {
+                let val_display = if f.kind == PropKind::SecretMap {
+                    // Entries are listed as their own `<path>.<KEY>` rows;
+                    // the container row is the add affordance.
+                    crate::i18n::t("zc-config-secret-map-add")
+                } else if f.is_secret {
                     "••••••".to_string()
                 } else {
                     f.value
@@ -4356,6 +4521,34 @@ impl App {
                     ))),
                     r.main,
                 );
+                self.draw_status(frame, r);
+                return;
+            }
+
+            if field.kind == PropKind::SecretMap {
+                // Two-step add: key in clear text, then its value masked.
+                let (hint, masked, title) = match &self.secret_map_entry_key {
+                    None => (
+                        crate::i18n::t("zc-config-secret-map-key-prompt"),
+                        false,
+                        format!(" {short_name} \u{203a} + "),
+                    ),
+                    Some(key) => (
+                        crate::i18n::t_args(
+                            "zc-config-secret-map-value-prompt",
+                            &[("key", key.as_str())],
+                        ),
+                        true,
+                        format!(" {short_name} \u{203a} {key} "),
+                    ),
+                };
+                let input_display = scalar_edit_display(&self.edit_buf, self.edit_cursor, masked);
+                let input = Paragraph::new(vec![
+                    Line::from(Span::styled(hint, theme::dim_style())),
+                    Line::from(Span::styled(input_display, theme::input_style())),
+                ])
+                .block(theme::panel_block(&title));
+                frame.render_widget(input, r.main);
                 self.draw_status(frame, r);
                 return;
             }
@@ -4886,6 +5079,7 @@ fn edit_in_external_editor(
     let _ = execute!(
         term.backend_mut(),
         PopKeyboardEnhancementFlags,
+        Print(mouse_shift_capture_sequence(false)),
         LeaveAlternateScreen
     );
     let _ = disable_raw_mode();
@@ -4899,7 +5093,11 @@ fn edit_in_external_editor(
 
     // Restore TUI.
     let _ = enable_raw_mode();
-    let _ = execute!(term.backend_mut(), EnterAlternateScreen);
+    let _ = execute!(
+        term.backend_mut(),
+        EnterAlternateScreen,
+        Print(mouse_shift_capture_sequence(true))
+    );
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             term.backend_mut(),
@@ -4930,6 +5128,28 @@ fn edit_in_external_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_shift_capture_uses_xtshiftescape_sequences() {
+        assert_eq!(mouse_shift_capture_sequence(true), "\x1b[>1s");
+        assert_eq!(mouse_shift_capture_sequence(false), "\x1b[>0s");
+    }
+
+    #[test]
+    fn model_field_catalog_reference_preserves_typed_alias() {
+        assert_eq!(
+            model_field_catalog_reference("providers.models.hailo_ollama.edge.model"),
+            Some("hailo_ollama.edge".to_string())
+        );
+        assert_eq!(
+            model_field_catalog_reference("providers.models.openai.default.model"),
+            Some("openai.default".to_string())
+        );
+        assert_eq!(
+            model_field_catalog_reference("providers.models.ollama.default"),
+            None
+        );
+    }
 
     #[test]
     fn config_scalar_validation_rejects_invalid_integer() {
@@ -5071,6 +5291,226 @@ mod tests {
         );
     }
 
+    /// Fake daemon reply policy for the handler-level timeout tests.
+    const DAEMON_SILENT: u8 = 0;
+    const DAEMON_ANSWER: u8 = 1;
+    const DAEMON_FAIL: u8 = 2;
+
+    /// A config manager wired to an in-process fake daemon. The daemon reads
+    /// every request frame the client sends, records its method, and then
+    /// stays silent (so the client's own 5s `call` deadline fires), answers
+    /// with an empty field list, or answers with a JSON-RPC error, per
+    /// `mode`.
+    fn manager_with_fake_daemon() -> (
+        App,
+        Arc<std::sync::atomic::AtomicU8>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use crate::jsonrpc::{JsonRpcError, RpcOutbound};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mode = Arc::new(AtomicU8::new(DAEMON_SILENT));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (daemon_mode, daemon_seen) = (mode.clone(), seen.clone());
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let request: serde_json::Value =
+                    serde_json::from_str(&frame).expect("client sends JSON-RPC frames");
+                let id = request["id"].as_str().unwrap_or_default().to_string();
+                daemon_seen
+                    .lock()
+                    .unwrap()
+                    .push(request["method"].as_str().unwrap_or_default().to_string());
+                match daemon_mode.load(Ordering::SeqCst) {
+                    DAEMON_ANSWER => outbound.dispatch_response(
+                        &id,
+                        Some(serde_json::json!({ "entries": [] })),
+                        None,
+                    ),
+                    DAEMON_FAIL => outbound.dispatch_response(
+                        &id,
+                        None,
+                        Some(JsonRpcError {
+                            code: -32000,
+                            message: "boom".to_string(),
+                            data: None,
+                        }),
+                    ),
+                    _ => {}
+                }
+            }
+        });
+        let mut mgr = App::new(rpc, std::path::Path::new("/tmp"));
+        mgr.sections = vec![
+            entry_with_cost("alpha", ""),
+            entry_with_cost("beta", ""),
+            entry_with_cost("gamma", ""),
+        ];
+        (mgr, mode, seen)
+    }
+
+    /// The real handlers take the app's `Term`. A fixed viewport never
+    /// queries the tty, and the section-list paths these tests drive never
+    /// draw through it, so nothing is written to stdout.
+    fn handler_term() -> Term {
+        Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 160, 40)),
+            },
+        )
+        .expect("fixed-viewport terminal")
+    }
+
+    /// Render through `draw_into`, the same entry point `app::run` uses for
+    /// the Config mode, and return the screen as text.
+    fn render_config(mgr: &mut App) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        term.draw(|frame| {
+            let area = frame.area();
+            mgr.draw_into(frame, area);
+        })
+        .unwrap();
+        let buffer = term.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn mouse_at(kind: MouseEventKind, area: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: area.x + area.width / 2,
+            row: area.y + area.height / 2,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    // Paused clock: the client's real 5s `call` deadline elapses instantly.
+    #[tokio::test(start_paused = true)]
+    async fn config_pane_survives_rpc_timeout_on_real_key_and_mouse_input() {
+        use std::sync::atomic::Ordering;
+        let (mut mgr, mode, seen) = manager_with_fake_daemon();
+        let mut term = handler_term();
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        // Like `init`, eagerly load the first section while the daemon
+        // answers, so the timeouts below land on a loaded detail screen whose
+        // existing status row shows them.
+        mode.store(DAEMON_ANSWER, Ordering::SeqCst);
+        mgr.load_section_content(0)
+            .await
+            .expect("first section loads");
+        mode.store(DAEMON_SILENT, Ordering::SeqCst);
+        render_config(&mut mgr);
+        let section_pane = mgr.last_section_pane_area;
+        let area = Rect::new(0, 0, 160, 40);
+
+        // Key: Down previews `beta`; its config/list gets no reply.
+        let quit = mgr.handle_key(down, &mut term).await;
+        assert!(
+            matches!(quit, Ok(false)),
+            "a timed-out RPC under a key must neither quit nor propagate: {quit:?}"
+        );
+        let screen = render_config(&mut mgr);
+        assert!(
+            screen.contains("config/list") && screen.contains("timed out after 5s"),
+            "timeout must be visible in the status line after a key:\n{screen}"
+        );
+
+        // Mouse: scrolling over the section pane previews `gamma`, also
+        // unanswered.
+        let scrolled = mgr
+            .handle_mouse(
+                mouse_at(MouseEventKind::ScrollDown, section_pane),
+                area,
+                &mut term,
+            )
+            .await;
+        assert!(
+            scrolled.is_ok(),
+            "a timed-out RPC under a mouse event must not propagate: {scrolled:?}"
+        );
+        assert_eq!(mgr.section_cursor, 2);
+        let screen = render_config(&mut mgr);
+        assert!(
+            screen.contains("timed out after 5s"),
+            "timeout must be visible in the status line after a mouse event:\n{screen}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["config/list", "config/list", "config/list"],
+            "the initial load and both inputs must have reached the daemon"
+        );
+
+        // The daemon recovers: further key and mouse input works normally.
+        mode.store(DAEMON_ANSWER, Ordering::SeqCst);
+        let quit = mgr.handle_key(up, &mut term).await;
+        assert!(matches!(quit, Ok(false)), "{quit:?}");
+        assert_eq!(
+            mgr.loaded_section,
+            Some(1),
+            "Up must load `beta` once answered"
+        );
+        assert!(mgr.status_msg.is_none());
+        let screen = render_config(&mut mgr);
+        assert!(
+            !screen.contains("timed out"),
+            "status clears on the next successful input:\n{screen}"
+        );
+        let scrolled = mgr
+            .handle_mouse(
+                mouse_at(MouseEventKind::ScrollUp, section_pane),
+                area,
+                &mut term,
+            )
+            .await;
+        assert!(scrolled.is_ok(), "{scrolled:?}");
+        assert_eq!(
+            mgr.loaded_section,
+            Some(0),
+            "scroll must load `alpha` once answered"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn config_pane_handlers_still_propagate_non_timeout_rpc_errors() {
+        use std::sync::atomic::Ordering;
+        let (mut mgr, mode, seen) = manager_with_fake_daemon();
+        mode.store(DAEMON_FAIL, Ordering::SeqCst);
+        let mut term = handler_term();
+        render_config(&mut mgr);
+        let section_pane = mgr.last_section_pane_area;
+
+        let quit = mgr
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+            .await;
+        let error = quit.expect_err("a daemon error is not a timeout and must propagate");
+        assert!(format!("{error:#}").contains("boom"), "{error:#}");
+        assert!(
+            mgr.status_msg.is_none(),
+            "only timeouts become a status line"
+        );
+
+        let scrolled = mgr
+            .handle_mouse(
+                mouse_at(MouseEventKind::ScrollDown, section_pane),
+                Rect::new(0, 0, 160, 40),
+                &mut term,
+            )
+            .await;
+        assert!(scrolled.is_err(), "mouse path must propagate it too");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
     fn test_manager() -> App {
         use crate::jsonrpc::RpcOutbound;
         use tokio::sync::mpsc;
@@ -5186,6 +5626,137 @@ mod tests {
             tab: ConfigTab::None,
             alias_source: None,
         }
+    }
+
+    fn secret_map_field(path: &str) -> ConfigFieldEntry {
+        let mut f = field(path);
+        f.kind = PropKind::SecretMap;
+        f.is_secret = true;
+        f
+    }
+
+    /// Manager whose RPC is answered by a scripted fake daemon: every
+    /// outbound request is recorded and acknowledged (`config/list` gets an
+    /// empty entry list, everything else `{}`).
+    fn test_manager_with_recording_rpc() -> (App, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responder = Arc::clone(&outbound);
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let Ok(req) = serde_json::from_str::<serde_json::Value>(&frame) else {
+                    continue;
+                };
+                let id = req["id"].as_str().unwrap_or_default().to_string();
+                let result = if req["method"] == "config/list" {
+                    serde_json::json!({ "entries": [] })
+                } else {
+                    serde_json::json!({})
+                };
+                recorder.lock().unwrap().push(req);
+                responder.dispatch_response(&id, Some(result), None);
+            }
+        });
+        let rpc = Arc::new(RpcClient::with_rpc(outbound));
+        (App::new(rpc, std::path::Path::new("/tmp")), seen)
+    }
+
+    async fn type_text(manager: &mut App, text: &str) {
+        for c in text.chars() {
+            manager
+                .handle_field_edit(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn press_enter(manager: &mut App) {
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn secret_map_entry_kind_deserializes_from_daemon_wire_tag() {
+        let entry: ConfigFieldEntry = serde_json::from_value(serde_json::json!({
+            "path": "mcp.servers.acme.env",
+            "category": "Mcp",
+            "kind": "secret_map",
+            "type_hint": "HashMap<String,String>",
+            "populated": false,
+            "is_secret": true,
+            "description": "Optional environment variables for stdio transport.",
+        }))
+        .unwrap();
+        assert_eq!(entry.kind, PropKind::SecretMap);
+        assert_eq!(entry.kind.wire_name(), "secret_map");
+    }
+
+    #[test]
+    fn secret_map_key_validation_rejects_unusable_names() {
+        assert_eq!(
+            secret_map_key_validation_key(""),
+            Some("zc-config-secret-map-key-empty")
+        );
+        for bad in ["HAS SPACE", "A=B", "TAB\tKEY", "NL\nKEY"] {
+            assert_eq!(
+                secret_map_key_validation_key(bad),
+                Some("zc-config-secret-map-key-invalid"),
+                "{bad:?}"
+            );
+        }
+        for good in ["GITHUB_TOKEN", "Authorization", "X-Api-Key", "x.dotted"] {
+            assert_eq!(secret_map_key_validation_key(good), None, "{good:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_map_row_adds_entry_in_two_steps() {
+        let (mut manager, seen) = test_manager_with_recording_rpc();
+        manager.fields = vec![secret_map_field("mcp.servers.acme.env")];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "mcp.servers.acme".into(),
+            breadcrumb: vec!["mcp.servers".into(), "acme".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+
+        // Step 1: an invalid key is refused without any RPC.
+        type_text(&mut manager, "BAD KEY").await;
+        press_enter(&mut manager).await;
+        assert!(manager.secret_map_entry_key.is_none());
+        assert!(manager.status_msg.is_some());
+        manager.edit_buf.clear();
+        manager.edit_cursor = 0;
+
+        type_text(&mut manager, "API_TOKEN").await;
+        press_enter(&mut manager).await;
+        assert_eq!(manager.secret_map_entry_key.as_deref(), Some("API_TOKEN"));
+        assert!(manager.edit_buf.is_empty(), "value step starts blank");
+
+        // Step 2: an empty value is refused (it would remove the entry).
+        press_enter(&mut manager).await;
+        assert_eq!(manager.secret_map_entry_key.as_deref(), Some("API_TOKEN"));
+        assert!(seen.lock().unwrap().is_empty(), "no RPC before a value");
+
+        type_text(&mut manager, "s3cr3t").await;
+        press_enter(&mut manager).await;
+
+        let requests = seen.lock().unwrap().clone();
+        let set = requests
+            .iter()
+            .find(|r| r["method"] == "config/set")
+            .expect("config/set must be sent");
+        assert_eq!(set["params"]["prop"], "mcp.servers.acme.env.API_TOKEN");
+        assert_eq!(set["params"]["value"], "s3cr3t");
+        assert!(manager.secret_map_entry_key.is_none());
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
     }
 
     #[tokio::test]
@@ -5336,6 +5907,352 @@ mod tests {
         assert_eq!(
             mgr.edit_buf, "<unset>",
             "populated scalar values must be preserved verbatim"
+        );
+    }
+
+    /// Manager wired to a responder task that records every request method
+    /// and answers config/set and config/list. List responses echo the
+    /// two-field tabbed fixture, applying the saved value to a.second.
+    fn responding_manager() -> (App, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(writer_tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let manager = App::new(rpc, std::path::Path::new("/tmp"));
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_for_task = Arc::clone(&calls);
+        let outbound_for_task = Arc::clone(&outbound);
+        tokio::spawn(async move {
+            let mut saved: Option<(String, serde_json::Value)> = None;
+            while let Some(raw) = writer_rx.recv().await {
+                let Ok(req) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                let method = req["method"].as_str().unwrap_or_default().to_string();
+                calls_for_task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(method.clone());
+                let id = req["id"].as_str().unwrap_or_default().to_string();
+                let result = if method == crate::client::method::CONFIG_SET {
+                    saved = Some((
+                        req["params"]["prop"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        req["params"]["value"].clone(),
+                    ));
+                    serde_json::json!({})
+                } else if method == crate::client::method::CONFIG_LIST {
+                    let mut first = field("a.first");
+                    first.tab = ConfigTab::Connection;
+                    let mut second = field("a.second");
+                    second.tab = ConfigTab::Advanced;
+                    if let Some((prop, value)) = &saved
+                        && prop == "a.second"
+                    {
+                        second.value = Some(value.clone());
+                        second.populated = true;
+                    }
+                    serde_json::json!({ "entries": [
+                        serde_json::to_value(&first).unwrap(),
+                        serde_json::to_value(&second).unwrap(),
+                    ] })
+                } else {
+                    serde_json::json!({})
+                };
+                outbound_for_task.dispatch_response(&id, Some(result), None);
+            }
+        });
+        (manager, calls)
+    }
+
+    #[tokio::test]
+    async fn scalar_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a scalar save must issue exactly one set and one list request"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 1, "the active tab must survive a save");
+        assert_eq!(manager.field_cursor, 1, "the cursor must survive a save");
+        assert!(
+            manager.tab_field_indices().contains(&manager.field_cursor),
+            "the restored cursor must be visible on the active tab"
+        );
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!("new")));
+    }
+
+    #[tokio::test]
+    async fn multiline_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.kind = PropKind::StringArray;
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.edit_buf = "x\ny".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a multiline save must issue exactly one set and one list request"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 1, "the active tab must survive a save");
+        assert_eq!(manager.field_cursor, 1, "the cursor must survive a save");
+        assert!(
+            manager.tab_field_indices().contains(&manager.field_cursor),
+            "the restored cursor must be visible on the active tab"
+        );
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!(["x", "y"])));
+    }
+
+    #[tokio::test]
+    async fn choice_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.kind = PropKind::Enum;
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.select_items = vec!["one".into(), "two".into()];
+
+        manager.commit_select(1).await.unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a choice save must issue exactly one set and one list request"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 1, "the active tab must survive a save");
+        assert_eq!(manager.field_cursor, 1, "the cursor must survive a save");
+        assert!(
+            manager.tab_field_indices().contains(&manager.field_cursor),
+            "the restored cursor must be visible on the active tab"
+        );
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!("two")));
+    }
+
+    #[tokio::test]
+    async fn skill_bundle_save_invalidates_the_skills_list_without_an_eager_fetch() {
+        let (mut manager, calls) = responding_manager();
+        let mut description = field("skill-bundles.demo.description");
+        description.tab = ConfigTab::Settings;
+        let mut include = field("skill-bundles.demo.include");
+        include.tab = ConfigTab::Settings;
+        manager.fields = vec![description, include];
+        manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Skills];
+        manager.active_tab = 0;
+        manager.skills_bundle = "demo".into();
+        manager.skills_list = vec![crate::client::SkillListEntry {
+            name: "from-dir-a".into(),
+        }];
+        manager.skills_active = Some("from-dir-a".into());
+        manager.skills_body = "stale".into();
+        manager.skills_body_loaded = "stale".into();
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "skill-bundles.demo".into(),
+            breadcrumb: vec!["skill-bundles.demo".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a skill-bundle save must refresh once and never eagerly fetch skills"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 0, "the active tab must survive a save");
+        assert!(
+            manager.skills_list.is_empty(),
+            "a save in the section must drop the cached skills list"
+        );
+        assert!(
+            manager.skills_active.is_none(),
+            "a save in the section must drop the cached skills selection"
+        );
+        assert!(
+            manager.skills_body.is_empty(),
+            "a save in the section must drop the cached skill body"
+        );
+        assert_eq!(
+            manager.skills_bundle, "demo",
+            "the bundle identity is derived from the prefix and must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_save_invalidates_the_personality_files_without_an_eager_fetch() {
+        let (mut manager, calls) = responding_manager();
+        let mut model = field("agents.demo.model");
+        model.tab = ConfigTab::Settings;
+        let mut workspace = field("agents.demo.workspace.path");
+        workspace.tab = ConfigTab::Settings;
+        manager.fields = vec![model, workspace];
+        manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Personality];
+        manager.active_tab = 0;
+        manager.personality_agent = "demo".into();
+        manager.personality_files = vec![crate::client::PersonalityFileEntry {
+            filename: "SOUL.md".into(),
+            exists: true,
+            size: 3,
+        }];
+        manager.personality_active_file = Some("SOUL.md".into());
+        manager.personality_content = "stale".into();
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "agents.demo".into(),
+            breadcrumb: vec!["agents.demo".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "an agent save must refresh once and never eagerly fetch personality files"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 0, "the active tab must survive a save");
+        assert!(
+            manager.personality_files.is_empty(),
+            "a save in the section must drop the cached personality file list"
+        );
+        assert!(
+            manager.personality_active_file.is_none(),
+            "a save in the section must drop the cached personality selection"
+        );
+        assert!(
+            manager.personality_content.is_empty(),
+            "a save in the section must drop the cached personality content"
+        );
+        assert_eq!(
+            manager.personality_agent, "demo",
+            "the agent identity is derived from the prefix and must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_section_save_leaves_composite_state_alone() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.skills_list = vec![crate::client::SkillListEntry {
+            name: "unrelated".into(),
+        }];
+        manager.personality_files = vec![crate::client::PersonalityFileEntry {
+            filename: "SOUL.md".into(),
+            exists: true,
+            size: 3,
+        }];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "the save must go through the ordinary single-refresh path"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(
+            manager.skills_list.len(),
+            1,
+            "a save outside composite sections must not drop the skills list"
+        );
+        assert_eq!(
+            manager.personality_files.len(),
+            1,
+            "a save outside composite sections must not drop the personality files"
         );
     }
 }

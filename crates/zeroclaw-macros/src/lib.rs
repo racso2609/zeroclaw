@@ -16,9 +16,18 @@ fn is_compound_type(ty: &syn::Type) -> bool {
     ident == "Vec" || ident == "HashMap"
 }
 
-/// Check if any `#[serde(...)]` attribute on the field contains `skip`.
+/// Check if any `#[serde(...)]` attribute on the field contains `skip` or
+/// `skip_serializing`, both of which keep the field out of property
+/// enumeration.
+///
+/// `skip_serializing` (the bare form, not `skip_serializing_if`) marks a
+/// write-only field: it may still deserialize, but it is never written back
+/// out. Such a field cannot be a settable property, because a `set_prop` on
+/// it is silently discarded by the next save and the value is gone after the
+/// following reload. Excluding it here keeps property enumeration limited to
+/// fields that actually survive a save/reload round-trip.
 fn has_serde_skip(field: &syn::Field) -> bool {
-    has_serde_meta(field, "skip")
+    has_serde_meta(field, "skip") || has_serde_meta(field, "skip_serializing")
 }
 
 fn has_serde_flatten(field: &syn::Field) -> bool {
@@ -328,9 +337,44 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 } else {
                     quote! { &mut self.#field_ident }
                 };
+                let container_type_hint = shape_ty.to_token_stream().to_string().replace(' ', "");
+                let container_type_hint_lit = container_type_hint.as_str();
+                // Display for the container row: sorted key names only (never
+                // values), or `<unset>` when the map is absent/empty. Shared by
+                // `prop_fields` and `get_prop` so the two never disagree.
+                let container_display = quote! {
+                    match #map_expr {
+                        Some(map) if !map.is_empty() => {
+                            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                            keys.sort_unstable();
+                            keys.join(", ")
+                        }
+                        _ => crate::config::UNSET_DISPLAY.to_string(),
+                    }
+                };
                 dynamic_secret_map_prop_fields.push(quote! {
+                    // Container row: always present, so surfaces can offer
+                    // "add key" on an empty map. Entries follow as
+                    // `<path>.<KEY>` rows in stable (sorted) order.
+                    fields.push(crate::config::PropFieldInfo {
+                        name: #full_name_lit.to_string(),
+                        category: #category_lit,
+                        display_value: #container_display,
+                        type_hint: #container_type_hint_lit,
+                        kind: crate::config::PropKind::SecretMap,
+                        is_secret: true,
+                        enum_variants: None::<fn() -> Vec<String>>,
+                        description: #description_lit,
+                        derived_from_secret: false,
+                        credential_class: #credential_class_expr,
+                        tab: #tab_token,
+                        alias_source: None,
+                        multiline: false,
+                    });
                     if let Some(map) = #map_expr {
-                        for (key, value) in map {
+                        let mut entries: Vec<(&String, &String)> = map.iter().collect();
+                        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                        for (key, value) in entries {
                             fields.push(crate::config::PropFieldInfo {
                                 name: format!("{}.{}", #full_name_lit, key),
                                 category: #category_lit,
@@ -354,6 +398,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
                 dynamic_secret_map_get_prop.push(quote! {
+                    if name == #full_name_lit {
+                        return Ok(#container_display);
+                    }
                     if let Some(key) = name
                         .strip_prefix(#full_name_lit)
                         .and_then(|s| s.strip_prefix('.'))
@@ -367,16 +414,41 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
                 dynamic_secret_map_set_prop.push(quote! {
+                    if name == #full_name_lit {
+                        // `name` is struct-local here (a natural-key or map
+                        // parent strips its alias before delegating), so the
+                        // message refers to "this path" rather than echoing
+                        // a path the caller never typed.
+                        anyhow::bail!(
+                            "`{}` is a key/value map and cannot be set directly; \
+                             set one entry at a time as `<this path>.<KEY>` \
+                             (an empty value removes that entry)",
+                            #field_name_kebab,
+                        );
+                    }
                     if let Some(key) = name
                         .strip_prefix(#full_name_lit)
                         .and_then(|s| s.strip_prefix('.'))
                         .filter(|key| !key.is_empty())
                     {
-                        (#map_mut_expr).insert(key.to_string(), value_str.to_string());
+                        // An empty value removes the entry. Empty entries
+                        // already display as `<unset>`, and `config delete`
+                        // resets a property by setting it to "", so this
+                        // makes delete actually drop the key instead of
+                        // leaving `KEY = ""` behind (e.g. an empty env var
+                        // exported to an MCP child process).
+                        if value_str.is_empty() {
+                            (#map_mut_expr).remove(key);
+                        } else {
+                            (#map_mut_expr).insert(key.to_string(), value_str.to_string());
+                        }
                         return Ok(());
                     }
                 });
                 dynamic_secret_map_prop_is_secret.push(quote! {
+                    if name == #full_name_lit {
+                        return true;
+                    }
                     if name
                         .strip_prefix(#full_name_lit)
                         .and_then(|s| s.strip_prefix('.'))
@@ -2934,6 +3006,25 @@ mod tests {
             pub value: Option<String>
         };
         assert!(!has_serde_skip(&field));
+    }
+
+    #[test]
+    fn has_serde_skip_detects_skip_serializing() {
+        // A write-only compatibility shim: it still deserializes (and
+        // discards what it read), but it is never serialized back out, so it
+        // must not be enumerated as a settable property.
+        let field: syn::Field = parse_quote! {
+            #[serde(default, skip_serializing, deserialize_with = "f")]
+            pub nevis: Option<serde_json::Value>
+        };
+        assert!(has_serde_skip(&field));
+
+        // Bare `skip_serializing` only: still skipped.
+        let field: syn::Field = parse_quote! {
+            #[serde(skip_serializing)]
+            pub shim: Option<String>
+        };
+        assert!(has_serde_skip(&field));
     }
 
     #[test]

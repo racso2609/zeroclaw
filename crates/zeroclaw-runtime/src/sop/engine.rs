@@ -17,11 +17,12 @@ use super::store::{
 };
 use super::types::{
     DeterministicRunState, DeterministicSavings, FilesystemEventKind, Sop, SopAdmission,
-    SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRun, SopRunAction,
-    SopRunStatus, SopRunSummary, SopStep, SopStepKind, SopStepResult, SopStepStatus, SopTrigger,
-    SopTriggerSource,
+    SopAdmissionPolicy, SopEvent, SopExecutionMode, SopExecutionWitness, SopPriority, SopRun,
+    SopRunAction, SopRunStatus, SopRunSummary, SopStep, SopStepKind, SopStepResult, SopStepStatus,
+    SopTrigger, SopTriggerSource,
 };
 use crate::calendar::{CALENDAR_NO_SHOW_TOPIC, CalendarNoShowEvent};
+use crate::live_config_authority::AgentExecutionCapability;
 use crate::security::{ContentSafety, new_marker_id};
 use serde_json::Value;
 use zeroclaw_config::schema::SopConfig;
@@ -107,6 +108,9 @@ pub struct SopEngine {
     /// until maintenance can persist the terminal `Failed` transition. This set
     /// creates the safe-boundary fact; it does not duplicate durable run state.
     step_budget_finalization_ready: std::collections::HashSet<String>,
+    /// Authority capability used to capture target admissions on executable
+    /// actions. Unmanaged standalone engines leave this unset.
+    execution_capability: Option<AgentExecutionCapability>,
     /// Run IDs currently owned by a headless driver task. A resumed action can
     /// be scheduled from several surfaces (HTTP approve, WS, channel, RPC), and
     /// two drivers over one run execute the same step twice and hand the engine
@@ -118,7 +122,7 @@ pub struct SopEngine {
     /// leaves the run `Running` and claimed with nobody to write the terminal
     /// state again; maintenance consumes this map until the write lands. The
     /// durable run row stays the source of truth for status.
-    pending_orphan_settlements: std::collections::HashMap<String, OrphanedRunSettlement>,
+    pending_orphan_settlements: OrphanedRunSettlementQueue,
     /// Decision models by alias, consulted by dispatch for SOPs with a
     /// `[decision]` table. An SOP whose alias is absent resolves fail-closed.
     decision_models: HashMap<String, Arc<dyn super::decision::DecisionModel>>,
@@ -174,7 +178,7 @@ impl MaintenanceSummary {
 
 /// Why a run is waiting on a terminal write that no driver will ever make.
 ///
-/// Both cases are runs the engine still holds as active, with an execution
+/// These are runs the engine still holds as active, with an execution
 /// claim, but that nothing is left to advance. Each settles through the normal
 /// claim-releasing terminal path; the kind only decides the terminal status and
 /// the durable event that explains it.
@@ -186,6 +190,33 @@ pub enum OrphanedRunSettlement {
     /// A reload aborted the run's driver mid-drive. Settled `Failed`: the step
     /// was underway and did not finish.
     DriverAborted,
+    /// Execution authority rejected the next step before its target ran.
+    /// Settled `Cancelled`: the driver stopped without executing that step.
+    ExecutionRejected,
+}
+
+/// Canonical pending terminal writes, retained across daemon generations.
+/// Handles may be handed off, but only an engine mutates or retries entries.
+#[derive(Clone, Default)]
+pub struct OrphanedRunSettlementQueue {
+    pending: Arc<parking_lot::Mutex<std::collections::HashMap<String, OrphanedRunSettlement>>>,
+    settlement: Arc<parking_lot::Mutex<()>>,
+}
+
+impl OrphanedRunSettlementQueue {
+    /// Observe the shared gate while a test pauses an engine's durable read.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn settlement_in_progress_for_test(&self) -> bool {
+        self.settlement.is_locked()
+    }
+
+    fn snapshot(&self) -> Vec<(String, OrphanedRunSettlement)> {
+        self.pending
+            .lock()
+            .iter()
+            .map(|(run_id, kind)| (run_id.clone(), *kind))
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -332,6 +363,7 @@ pub(crate) struct StartReservation {
     sop: Sop,
     deterministic: bool,
     decided_mode: Option<SopExecutionMode>,
+    decisions: std::collections::BTreeMap<u32, f64>,
 }
 
 impl StartReservation {
@@ -344,6 +376,12 @@ impl StartReservation {
     /// activation, because activation already gates the first step.
     pub(crate) fn set_decided_mode(&mut self, mode: Option<SopExecutionMode>) {
         self.decided_mode = mode;
+    }
+
+    /// Conditional-part answers (step -> p(yes)) for this run, set before
+    /// activation because activation dispatches step 1.
+    pub(crate) fn set_decisions(&mut self, decisions: std::collections::BTreeMap<u32, f64>) {
+        self.decisions = decisions;
     }
 }
 
@@ -388,8 +426,9 @@ impl SopEngine {
             claims_retained_after_terminal_rollback: std::collections::HashSet::new(),
             cancellation_finalization_ready: std::collections::HashSet::new(),
             step_budget_finalization_ready: std::collections::HashSet::new(),
+            execution_capability: None,
             headless_drivers: std::collections::HashSet::new(),
-            pending_orphan_settlements: std::collections::HashMap::new(),
+            pending_orphan_settlements: OrphanedRunSettlementQueue::default(),
             decision_models: HashMap::new(),
         }
     }
@@ -452,6 +491,20 @@ impl SopEngine {
     pub fn with_capabilities(mut self, capabilities: Arc<SopCapabilityRegistry>) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Bind executable SOP actions to the daemon-owned authority. The binding
+    /// must be installed before managed producers can create actions.
+    pub fn with_execution_capability(
+        mut self,
+        execution_capability: AgentExecutionCapability,
+    ) -> Self {
+        self.execution_capability = Some(execution_capability);
+        self
+    }
+
+    pub fn has_execution_capability(&self) -> bool {
+        self.execution_capability.is_some()
     }
 
     /// Inject the approval broker (built from `[sop.approval]` config). Defaults to
@@ -1965,8 +2018,10 @@ impl SopEngine {
         sop_name: &str,
         event: SopEvent,
         decided_mode: Option<SopExecutionMode>,
+        decisions: std::collections::BTreeMap<u32, f64>,
     ) -> Result<SopRunAction> {
         let mut reservation = self.reserve_run_slot(sop_name)?;
+        reservation.set_decisions(decisions);
         reservation.set_decided_mode(decided_mode);
         self.activate_reserved_run(reservation, event, None)
     }
@@ -2023,6 +2078,7 @@ impl SopEngine {
             sop,
             deterministic,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         })
     }
 
@@ -2049,6 +2105,7 @@ impl SopEngine {
             sop,
             deterministic,
             decided_mode,
+            decisions,
         } = reservation;
 
         let run = SopRun {
@@ -2069,6 +2126,7 @@ impl SopEngine {
             revision: 0,
             revision_base: 0,
             decided_mode,
+            decisions,
         };
         let first_input = step_input_value(&run, 1);
         self.active_runs.insert(run_id.clone(), run);
@@ -2499,7 +2557,7 @@ impl SopEngine {
             });
         }
 
-        let run_data = RunData::from_step_results(&run.step_results);
+        let run_data = RunData::from_step_results(&run.step_results).with_decisions(&run.decisions);
         Ok(route::resolve_next(&RouteCtx {
             sop,
             run,
@@ -2606,6 +2664,79 @@ impl SopEngine {
         )?))
     }
 
+    /// Skip a conditional-part step whose decision says it does not apply to
+    /// this run (`decide` answered no, or `unless_decided` named a step answered
+    /// yes), record why, and continue with the next step in order — handing it
+    /// this step's input, since a skipped step produces no output. Returns
+    /// `None` when the step should run. Checked before any approval gate, so a
+    /// skipped part never asks for approval.
+    fn skip_for_decision(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        step: &SopStep,
+        input_override: Option<Value>,
+        deterministic: bool,
+    ) -> Result<Option<SopRunAction>> {
+        let (reason, input) = {
+            let Some(run) = self.active_runs.get(run_id) else {
+                return Ok(None);
+            };
+            let Some(reason) = decision_skip_reason(sop, step, &run.decisions) else {
+                return Ok(None);
+            };
+            let input = input_override.unwrap_or_else(|| step_input_value(run, step.number));
+            (reason, input)
+        };
+        let now = now_iso8601();
+        self.record_step_result(
+            run_id,
+            SopStepResult {
+                step_number: step.number,
+                status: SopStepStatus::Skipped,
+                output: reason.clone(),
+                started_at: now.clone(),
+                completed_at: Some(now),
+                effective_agent: None,
+                tool_calls: Vec::new(),
+            },
+        )?;
+        self.record_transition_event(
+            run_id,
+            "step_skipped",
+            Some(reason.clone()),
+            ::serde_json::json!({"step": step.number, "status": "decision"}),
+        );
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"run_id": run_id, "step": step.number})),
+            &format!("SOP run {run_id}: {reason}")
+        );
+        let next = sop
+            .steps
+            .iter()
+            .position(|s| s.number == step.number)
+            .and_then(|i| sop.steps.get(i + 1))
+            .map(|s| s.number);
+        let action = match next {
+            Some(next) if deterministic => {
+                self.dispatch_deterministic_step(run_id, sop, next, input)?
+            }
+            Some(next) => self.dispatch_llm_step(run_id, sop, next, Some(input))?,
+            None => self.apply_route_decision(
+                run_id,
+                sop,
+                step.number,
+                NextStep::Complete,
+                deterministic,
+                None,
+                None,
+            )?,
+        };
+        Ok(Some(action))
+    }
+
     fn dispatch_llm_step(
         &mut self,
         run_id: &str,
@@ -2622,6 +2753,12 @@ impl SopEngine {
             run.current_step = step_number;
             run.status = SopRunStatus::Running;
             run.waiting_since = None;
+        }
+
+        if let Some(action) =
+            self.skip_for_decision(run_id, sop, &step, input_override.clone(), false)?
+        {
+            return Ok(action);
         }
 
         let run_data = {
@@ -2665,8 +2802,10 @@ impl SopEngine {
         // SOP-level mode needs it (strictly stronger than the old
         // approval_mode-conditional escalation), so the mode param is gone.
         let decided_mode = self.active_runs.get(run_id).and_then(|r| r.decided_mode);
+        let sop = sop_for_run(sop, decided_mode);
         let action = resolve_step_action(
-            &sop_for_run(sop, decided_mode),
+            self.execution_capability.as_ref(),
+            &sop,
             &step,
             run_id.to_string(),
             context,
@@ -2686,9 +2825,9 @@ impl SopEngine {
         // the parked snapshot is durably persisted (else keep the claim, fail
         // closed).
         if parked_for_approval {
-            if let Some(reason) = self.pending_pool_full_reason(sop) {
+            if let Some(reason) = self.pending_pool_full_reason(&sop) {
                 Self::log_pending_capacity_full(run_id, &reason);
-                return Ok(self.mark_step_pending(run_id, sop, step.number, reason));
+                return Ok(self.mark_step_pending(run_id, &sop, step.number, reason));
             }
             if let Some(run) = self.active_runs.get_mut(run_id) {
                 run.status = SopRunStatus::WaitingApproval;
@@ -2702,9 +2841,9 @@ impl SopEngine {
                 // keeps the claim and the maintenance retry issues the notice later.
                 ParkPersistOutcome::Released => self.notify_park_request(run_id),
                 ParkPersistOutcome::CapacityFull => {
-                    let reason = self.pending_pool_capacity_raced_reason(sop);
+                    let reason = self.pending_pool_capacity_raced_reason(&sop);
                     Self::log_pending_capacity_full(run_id, &reason);
-                    return Ok(self.mark_step_pending(run_id, sop, step.number, reason));
+                    return Ok(self.mark_step_pending(run_id, &sop, step.number, reason));
                 }
                 ParkPersistOutcome::PersistFailed => {
                     let reason =
@@ -2796,6 +2935,12 @@ impl SopEngine {
             run.current_step = step_number;
             run.status = SopRunStatus::Running;
             run.waiting_since = None;
+        }
+
+        if let Some(action) =
+            self.skip_for_decision(run_id, sop, &step, Some(input.clone()), true)?
+        {
+            return Ok(action);
         }
 
         self.resolve_deterministic_action(sop, run_id, &step, input)
@@ -3302,6 +3447,36 @@ impl SopEngine {
         Ok(Some(prior))
     }
 
+    fn settle_run_for_rejected_execution(&mut self, run_id: &str) -> Result<Option<SopRunStatus>> {
+        let Some((prior, current_step)) = self
+            .active_runs
+            .get(run_id)
+            .map(|run| (run.status, run.current_step))
+        else {
+            return Ok(None);
+        };
+        if !matches!(prior, SopRunStatus::Running | SopRunStatus::CancelRequested) {
+            return Ok(None);
+        }
+        let reason = "execution authority rejected this step before target execution, so the \
+                      driver stopped and nothing will advance the run"
+            .to_string();
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "run_execution_rejected".to_string(),
+            actor: None,
+            reason: Some(reason.clone()),
+            payload: ::serde_json::json!({
+                "step": current_step,
+                "prior_status": prior.to_string(),
+            }),
+        };
+        self.finish_run_with_gate_event(run_id, SopRunStatus::Cancelled, Some(reason), &event)?;
+        Ok(Some(prior))
+    }
+
     /// Settle a run no driver will advance, keeping ownership of the retry.
     ///
     /// On success any pending retry for the run is cleared. On failure the run
@@ -3314,28 +3489,94 @@ impl SopEngine {
         run_id: &str,
         kind: OrphanedRunSettlement,
     ) -> Result<Option<SopRunStatus>> {
-        let result = match kind {
-            OrphanedRunSettlement::DrainedBeforeAdmission => {
-                self.settle_run_for_drained_generation(run_id)
-            }
-            OrphanedRunSettlement::DriverAborted => self.settle_run_for_aborted_driver(run_id),
-        };
+        // Old drivers can outlive reload. Serialize the durable read and write
+        // across engines, without holding the pending map through persistence.
+        let queue = self.pending_orphan_settlements.clone();
+        let _settlement = queue.settlement.lock();
+        let kind = self
+            .pending_orphan_settlements
+            .pending
+            .lock()
+            .get(run_id)
+            .copied()
+            .unwrap_or(kind);
+        let result = self
+            .load_orphaned_run_for_settlement(run_id, kind)
+            .and_then(|needs_settlement| match (needs_settlement, kind) {
+                (false, _) => Ok(None),
+                (true, OrphanedRunSettlement::DrainedBeforeAdmission) => {
+                    self.settle_run_for_drained_generation(run_id)
+                }
+                (true, OrphanedRunSettlement::DriverAborted) => {
+                    self.settle_run_for_aborted_driver(run_id)
+                }
+                (true, OrphanedRunSettlement::ExecutionRejected) => {
+                    self.settle_run_for_rejected_execution(run_id)
+                }
+            });
         match &result {
             Ok(_) => {
-                self.pending_orphan_settlements.remove(run_id);
+                self.pending_orphan_settlements
+                    .pending
+                    .lock()
+                    .remove(run_id);
             }
             Err(_) => {
                 self.pending_orphan_settlements
+                    .pending
+                    .lock()
                     .insert(run_id.to_string(), kind);
             }
         }
         result
     }
 
+    fn load_orphaned_run_for_settlement(
+        &mut self,
+        run_id: &str,
+        kind: OrphanedRunSettlement,
+    ) -> Result<bool> {
+        // A restored cache can be stale even when populated: another generation
+        // may already have settled this run through the shared queue.
+        if let Some(stored) = self.store.load_run(run_id)? {
+            if matches!(
+                stored.run.status,
+                SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
+            ) {
+                self.claims_pending_persist.remove(run_id);
+                self.claims_retained_after_terminal_rollback.remove(run_id);
+                self.cancellation_finalization_ready.remove(run_id);
+                self.step_budget_finalization_ready.remove(run_id);
+                self.active_runs.remove(run_id);
+                // This is view reconciliation, not another completion.
+                self.finished_runs.retain(|run| run.run_id != run_id);
+                self.finished_runs.push(stored.run);
+                let max = self.config.max_finished_runs;
+                if max > 0 && self.finished_runs.len() > max {
+                    let excess = self.finished_runs.len() - max;
+                    self.finished_runs.drain(..excess);
+                }
+                return Ok(false);
+            } else {
+                let needs_settlement = matches!(
+                    stored.run.status,
+                    SopRunStatus::Running | SopRunStatus::CancelRequested
+                ) || (kind == OrphanedRunSettlement::DrainedBeforeAdmission
+                    && stored.run.status == SopRunStatus::Pending);
+                if needs_settlement || self.active_runs.contains_key(run_id) {
+                    self.active_runs.insert(run_id.to_string(), stored.run);
+                }
+                return Ok(needs_settlement);
+            }
+        }
+        Ok(self.active_runs.contains_key(run_id))
+    }
+
     /// Hand this engine the retry for runs a previous engine could not settle.
     ///
-    /// A reload tears down the old generation before this engine exists. If
-    /// settling an aborted driver's run failed there, the durable row is still
+    /// A reload retires the old generation, but its stragglers may still be
+    /// settling through the shared queue. If their terminal write failed, the
+    /// durable row is still
     /// `Running`, and restoring it here would renew its claim with no driver
     /// to advance it. Recording the runs here makes this engine's maintenance
     /// the owner of that terminal write.
@@ -3343,22 +3584,37 @@ impl SopEngine {
         &mut self,
         runs: impl IntoIterator<Item = (String, OrphanedRunSettlement)>,
     ) {
-        self.pending_orphan_settlements.extend(runs);
+        let mut pending = self.pending_orphan_settlements.pending.lock();
+        for (run_id, kind) in runs {
+            pending.entry(run_id).or_insert(kind);
+        }
+    }
+
+    /// Retain the canonical retry queue even after its drivers were pruned.
+    #[must_use]
+    pub fn orphaned_run_settlement_queue(&self) -> OrphanedRunSettlementQueue {
+        self.pending_orphan_settlements.clone()
+    }
+
+    /// Transfer retry ownership without losing writes from late old producers.
+    pub fn adopt_orphaned_run_settlement_queue(&mut self, queue: OrphanedRunSettlementQueue) {
+        let pending = self.pending_orphan_settlements.snapshot();
+        self.pending_orphan_settlements = queue;
+        self.adopt_orphaned_run_settlements(pending);
     }
 
     /// Runs awaiting a retried terminal write, for callers and tests that need
     /// to see whether maintenance still owns one.
     #[must_use]
     pub fn has_pending_orphan_settlement(&self, run_id: &str) -> bool {
-        self.pending_orphan_settlements.contains_key(run_id)
+        self.pending_orphan_settlements
+            .pending
+            .lock()
+            .contains_key(run_id)
     }
 
     fn retry_pending_orphan_settlements(&mut self) -> usize {
-        let pending: Vec<(String, OrphanedRunSettlement)> = self
-            .pending_orphan_settlements
-            .iter()
-            .map(|(run_id, kind)| (run_id.clone(), *kind))
-            .collect();
+        let pending = self.pending_orphan_settlements.snapshot();
         let mut settled = 0;
         for (run_id, kind) in pending {
             match self.settle_orphaned_run(&run_id, kind) {
@@ -4324,17 +4580,14 @@ impl SopEngine {
         run.waiting_since = None;
         let context = format_step_context(&sop, run, &step, &self.config);
 
-        let mut step = step;
-        step.agent = step
-            .effective_agent(sop.agent.as_deref())
-            .map(str::to_string);
-
         Ok(GateClearTransition::Active {
-            action: Box::new(SopRunAction::ExecuteStep {
-                run_id: run_id.to_string(),
-                step,
+            action: Box::new(execute_step_action(
+                self.execution_capability.as_ref(),
+                &sop,
+                &step,
+                run_id.to_string(),
                 context,
-            }),
+            )),
             follow_up: None,
         })
     }
@@ -5748,7 +6001,10 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
         self.step_budget_finalization_ready.remove(run_id);
-        self.pending_orphan_settlements.remove(run_id);
+        self.pending_orphan_settlements
+            .pending
+            .lock()
+            .remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         // The park snapshot is purely a rehydration artifact: a terminal run must
@@ -5804,7 +6060,10 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
         self.step_budget_finalization_ready.remove(run_id);
-        self.pending_orphan_settlements.remove(run_id);
+        self.pending_orphan_settlements
+            .pending
+            .lock()
+            .remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         self.remove_deterministic_state_file(&run);
@@ -6428,7 +6687,16 @@ fn pending_step_blocks_direct_advance(sop: &Sop, step: &SopStep) -> bool {
 }
 
 /// Determine the action for a step based on the effective execution mode.
-fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: String) -> SopRunAction {
+/// Executable actions capture their authority admission here, before any
+/// caller can queue or spawn them. Approval actions remain lease-free while
+/// parked and acquire only when the gate produces the resumed action.
+fn resolve_step_action(
+    capability: Option<&AgentExecutionCapability>,
+    sop: &Sop,
+    step: &SopStep,
+    run_id: String,
+    context: String,
+) -> SopRunAction {
     let mut step = step.clone();
     step.agent = step
         .effective_agent(sop.agent.as_deref())
@@ -6442,11 +6710,26 @@ fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: Strin
             context,
         }
     } else {
-        SopRunAction::ExecuteStep {
-            run_id,
-            step: step.clone(),
-            context,
-        }
+        execute_step_action(capability, sop, step, run_id, context)
+    }
+}
+
+fn execute_step_action(
+    capability: Option<&AgentExecutionCapability>,
+    sop: &Sop,
+    step: &SopStep,
+    run_id: String,
+    context: String,
+) -> SopRunAction {
+    let mut step = step.clone();
+    step.agent = step
+        .effective_agent(sop.agent.as_deref())
+        .map(str::to_string);
+    SopRunAction::ExecuteStep {
+        run_id,
+        step,
+        context,
+        execution_witness: capability.map(SopExecutionWitness::capture),
     }
 }
 
@@ -6471,8 +6754,14 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep, config: &SopConf
         marker_id,
     ));
 
-    // Previous step summary
-    if let Some(prev) = run.step_results.last() {
+    // Previous step summary. A step skipped by its decision passes its input
+    // along, so the summary is the last step that actually ran.
+    if let Some(prev) = run
+        .step_results
+        .iter()
+        .rev()
+        .find(|result| !is_decision_skip(result))
+    {
         let _ = writeln!(
             ctx,
             "Previous: Step {} {} — {}",
@@ -6496,7 +6785,14 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep, config: &SopConf
 }
 
 pub(crate) fn step_input_value(run: &SopRun, step_number: u32) -> Value {
-    if step_number <= 1 {
+    // A step skipped by its decision produced no output, so it passes the
+    // input along: the next step sees the last real result (or the trigger).
+    let last_real = run
+        .step_results
+        .iter()
+        .rev()
+        .find(|result| !is_decision_skip(result));
+    if step_number <= 1 || last_real.is_none() {
         return run
             .trigger_event
             .payload
@@ -6505,10 +6801,47 @@ pub(crate) fn step_input_value(run: &SopRun, step_number: u32) -> Value {
             .unwrap_or(Value::Null);
     }
 
-    run.step_results
-        .last()
-        .map(step_result_value)
-        .unwrap_or(Value::Null)
+    last_real.map(step_result_value).unwrap_or(Value::Null)
+}
+
+/// Prefix of the recorded output for a step skipped by its decision.
+const DECISION_SKIP_PREFIX: &str = "skipped by decision:";
+
+fn is_decision_skip(result: &SopStepResult) -> bool {
+    result.status == SopStepStatus::Skipped && result.output.starts_with(DECISION_SKIP_PREFIX)
+}
+
+/// Why a conditional-part step does not apply to this run, if it does not:
+/// its own `decide` question was answered below `part_threshold`, or the step
+/// its `unless_decided` names was answered at or above it. A missing answer
+/// (model unavailable or malformed) never skips.
+fn decision_skip_reason(
+    sop: &Sop,
+    step: &SopStep,
+    decisions: &std::collections::BTreeMap<u32, f64>,
+) -> Option<String> {
+    let threshold = sop.decision.as_ref().map_or(0.5, |d| d.part_threshold);
+    if let (Some(question), Some(p)) = (&step.decide, decisions.get(&step.number))
+        && *p < threshold
+    {
+        // The question can carry long context; the reason names it, not repeats it.
+        let question = match question.char_indices().nth(80) {
+            Some((cut, _)) => format!("{}…", &question[..cut]),
+            None => question.clone(),
+        };
+        return Some(format!(
+            "{DECISION_SKIP_PREFIX} answered no to \"{question}\" (p(yes) {p:.2} < {threshold:.2})"
+        ));
+    }
+    if let Some(n) = step.unless_decided
+        && let Some(p) = decisions.get(&n)
+        && *p >= threshold
+    {
+        return Some(format!(
+            "{DECISION_SKIP_PREFIX} step {n}'s question was answered yes (p(yes) {p:.2} >= {threshold:.2})"
+        ));
+    }
+    None
 }
 
 /// Gate re-presentations per checkpoint a `Revise` may spend before the gate
@@ -6711,6 +7044,7 @@ mod tests {
     use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
     use crate::sop::step_contract::StepFailure;
     use crate::sop::types::{SopExecutionMode, StepSchema};
+    use std::collections::BTreeMap;
 
     /// Clear a WaitingApproval gate through the production out-of-band chokepoint
     /// (a CLI principal), returning the resumed action. Mirrors what a real
@@ -7488,6 +7822,60 @@ mod tests {
     }
 
     #[test]
+    fn managed_execute_step_witness_survives_step_advance_and_blocks_delete() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let authority = crate::live_config_authority::LiveConfigAuthority::new(config);
+        let mut engine = engine_with_sops(vec![test_sop(
+            "witnessed",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_execution_capability(authority.execution_capability());
+
+        let action = engine.start_run("witnessed", manual_event()).unwrap();
+        let (run_id, witness) = match action {
+            SopRunAction::ExecuteStep {
+                run_id,
+                execution_witness: Some(witness),
+                ..
+            } => (run_id, witness),
+            other => panic!("expected witnessed ExecuteStep, got {other:?}"),
+        };
+        let admission = witness.admit("alpha").unwrap();
+        assert_eq!(admission.alias(), "alpha");
+        assert_eq!(admission.generation(), 0);
+
+        let next = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "done".to_string(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: Some("alpha".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(next, SopRunAction::ExecuteStep { .. }));
+        assert!(matches!(
+            authority.agent_lifecycle().begin_delete("alpha"),
+            Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+        ));
+
+        drop(next);
+        drop(witness);
+        drop(admission);
+        assert!(authority.agent_lifecycle().begin_delete("alpha").is_ok());
+    }
+
+    #[test]
     fn run_notifier_publishes_on_admission() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(8);
         let mut engine = engine_with_sops(vec![test_sop(
@@ -7522,6 +7910,152 @@ mod tests {
     fn start_run_unknown_sop_fails() {
         let mut engine = engine_with_sops(vec![]);
         assert!(engine.start_run("nonexistent", manual_event()).is_err());
+    }
+
+    /// A three-step SOP whose step 1 asks "out of scope?", step 2 is a
+    /// conditional review part, and step 3 runs unless step 1 was yes.
+    fn parts_sop() -> Sop {
+        let mut sop = test_sop("parts", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.decision = Some(
+            toml::from_str::<crate::sop::decision::SopDecisionSpec>("model = \"jev\"").unwrap(),
+        );
+        sop.steps[0].decide = Some("Out of scope?".into());
+        sop.steps[1].decide = Some("Touches security?".into());
+        let mut compose = sop.steps[1].clone();
+        compose.number = 3;
+        compose.title = "Compose".into();
+        compose.decide = None;
+        compose.unless_decided = Some(1);
+        sop.steps.push(compose);
+        sop
+    }
+
+    fn completed(step_number: u32, output: &str) -> SopStepResult {
+        SopStepResult {
+            step_number,
+            status: SopStepStatus::Completed,
+            output: output.into(),
+            started_at: now_iso8601(),
+            completed_at: Some(now_iso8601()),
+            effective_agent: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn decision_parts_skip_declined_steps_and_pass_input_through() {
+        let mut engine = engine_with_sops(vec![parts_sop()]);
+        let event = SopEvent {
+            payload: Some(r#"{"pr":1}"#.into()),
+            ..manual_event()
+        };
+        // Step 1 (out of scope) answered no: skipped. Step 2 (security) yes.
+        let decisions = BTreeMap::from([(1, 0.1), (2, 0.9)]);
+        let action = engine
+            .start_run_with_mode("parts", event, None, decisions)
+            .unwrap();
+        let SopRunAction::ExecuteStep {
+            run_id,
+            step,
+            context,
+            ..
+        } = action
+        else {
+            panic!("expected step 2 to execute, got {action:?}");
+        };
+        assert_eq!(step.number, 2);
+        assert!(
+            context.contains(r#""pr""#),
+            "step 2 gets the trigger payload: {context}"
+        );
+        assert!(
+            !context.contains("Previous:"),
+            "a skip is not a previous result: {context}"
+        );
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(run.step_results.len(), 1);
+        assert_eq!(run.step_results[0].status, SopStepStatus::Skipped);
+        assert!(run.step_results[0].output.contains("Out of scope?"));
+
+        // Step 3 runs because step 1 was no, and reads step 2's output.
+        let action = engine
+            .advance_step(&run_id, completed(2, "review"))
+            .unwrap();
+        let SopRunAction::ExecuteStep { step, context, .. } = action else {
+            panic!("expected step 3, got {action:?}");
+        };
+        assert_eq!(step.number, 3);
+        assert!(
+            context.contains("Previous: Step 2 completed — review"),
+            "{context}"
+        );
+        let action = engine.advance_step(&run_id, completed(3, "done")).unwrap();
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+    }
+
+    #[test]
+    fn unless_decided_skips_to_completion_when_the_named_step_was_yes() {
+        let mut engine = engine_with_sops(vec![parts_sop()]);
+        // Out of scope (yes) runs step 1; security no skips step 2; step 3 is
+        // skipped by `unless_decided: 1`, and the run completes after step 1.
+        let decisions = BTreeMap::from([(1, 0.8), (2, 0.2)]);
+        let action = engine
+            .start_run_with_mode("parts", manual_event(), None, decisions)
+            .unwrap();
+        let SopRunAction::ExecuteStep { run_id, step, .. } = action else {
+            panic!("expected step 1, got {action:?}");
+        };
+        assert_eq!(step.number, 1);
+        let action = engine.advance_step(&run_id, completed(1, "hold")).unwrap();
+        assert!(
+            matches!(action, SopRunAction::Completed { .. }),
+            "{action:?}"
+        );
+        let run = &engine.finished_runs(Some("parts"))[0];
+        let statuses: Vec<_> = run
+            .step_results
+            .iter()
+            .map(|r| (r.step_number, r.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (1, SopStepStatus::Completed),
+                (2, SopStepStatus::Skipped),
+                (3, SopStepStatus::Skipped),
+            ]
+        );
+    }
+
+    #[test]
+    fn skip_reason_shortens_a_long_question() {
+        let mut sop = parts_sop();
+        sop.steps[0].decide = Some(format!("Scope check. {}", "context ".repeat(500)));
+        let reason =
+            decision_skip_reason(&sop, &sop.steps[0], &BTreeMap::from([(1, 0.1)])).unwrap();
+        assert!(reason.chars().count() < 200, "{reason}");
+        assert!(reason.contains("Scope check.") && reason.contains('…'));
+    }
+
+    #[test]
+    fn decision_parts_without_an_answer_run() {
+        let mut engine = engine_with_sops(vec![parts_sop()]);
+        let action = engine
+            .start_run_with_mode("parts", manual_event(), None, BTreeMap::new())
+            .unwrap();
+        let SopRunAction::ExecuteStep { step, .. } = action else {
+            panic!("expected step 1, got {action:?}");
+        };
+        assert_eq!(step.number, 1);
+    }
+
+    #[test]
+    fn when_conditions_can_read_decisions() {
+        let run_data = RunData::default().with_decisions(&BTreeMap::from([(2, 0.75)]));
+        assert_eq!(
+            run_data.get_path("$.decisions.2"),
+            Some(serde_json::json!(0.75))
+        );
     }
 
     #[test]
@@ -9098,6 +9632,7 @@ mod tests {
                 revision: 0,
                 revision_base: 0,
                 decided_mode: None,
+                decisions: std::collections::BTreeMap::new(),
             },
         );
         assert_eq!(
@@ -9151,6 +9686,7 @@ mod tests {
                     revision: 0,
                     revision_base: 0,
                     decided_mode: None,
+                    decisions: std::collections::BTreeMap::new(),
                 },
             );
         }
@@ -9197,6 +9733,7 @@ mod tests {
                 revision: 0,
                 revision_base: 0,
                 decided_mode: None,
+                decisions: std::collections::BTreeMap::new(),
             },
         );
         let step = SopStep {
@@ -9628,7 +10165,11 @@ mod tests {
             "only the failed first park still holds an exec claim"
         );
 
-        engine.config.approval_timeout_secs = 1;
+        // Use a large timeout so the second run (parked at whole-second
+        // `waiting_since`) cannot become overdue if the wall clock crosses a
+        // second boundary between park and this tick. The first run is still a
+        // timeout candidate because its waiting_since is back-dated below.
+        engine.config.approval_timeout_secs = 3600;
         engine.active_runs.get_mut(&first_id).unwrap().waiting_since =
             Some("2000-01-01T00:00:00Z".to_string());
         let summary = engine.run_maintenance_tick();
@@ -9880,6 +10421,7 @@ mod tests {
                 revision: 0,
                 revision_base: 0,
                 decided_mode: None,
+                decisions: std::collections::BTreeMap::new(),
             };
             store
                 .save_run(&PersistedRun::new(
@@ -10414,6 +10956,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         let ctx = format_step_context(&sop, &run, &sop.steps[0], &SopConfig::default());
         assert!(ctx.contains("pump-shutdown"));
@@ -11301,6 +11844,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(
@@ -11357,6 +11901,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(parked, now, SopTriggerSource::Manual))
@@ -11428,6 +11973,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(
@@ -13195,6 +13741,7 @@ mod tests {
                 revision: 0,
                 revision_base: 0,
                 decided_mode: None,
+                decisions: std::collections::BTreeMap::new(),
             },
         );
         let out = engine
@@ -13822,6 +14369,68 @@ type = "manual"
             agent: None,
             decision: None,
         }
+    }
+
+    #[test]
+    fn deterministic_decision_part_is_skipped_and_its_input_passed_on() {
+        let mut sop = deterministic_sop_all_execute("det-parts");
+        sop.decision = Some(
+            toml::from_str::<crate::sop::decision::SopDecisionSpec>("model = \"jev\"").unwrap(),
+        );
+        sop.steps[1].decide = Some("Needs step two?".into());
+        let mut three = sop.steps[1].clone();
+        three.number = 3;
+        three.title = "Step three".into();
+        three.decide = None;
+        sop.steps.push(three);
+        let mut engine = engine_with_sops(vec![sop]);
+
+        let action = engine
+            .start_run_with_mode(
+                "det-parts",
+                manual_event(),
+                None,
+                BTreeMap::from([(2, 0.1)]),
+            )
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 1)
+        );
+
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"a": 1}), None)
+            .unwrap();
+        let SopRunAction::DeterministicStep { step, input, .. } = action else {
+            panic!("expected step 3, got {action:?}");
+        };
+        assert_eq!(step.number, 3);
+        assert_eq!(
+            input,
+            serde_json::json!({"a": 1}),
+            "step 1's output passes over the skip"
+        );
+
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"b": 2}), None)
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Completed { .. }),
+            "{action:?}"
+        );
+        let statuses: Vec<_> = engine.finished_runs(Some("det-parts"))[0]
+            .step_results
+            .iter()
+            .map(|r| (r.step_number, r.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (1, SopStepStatus::Completed),
+                (2, SopStepStatus::Skipped),
+                (3, SopStepStatus::Completed),
+            ]
+        );
     }
 
     #[test]
@@ -16156,6 +16765,7 @@ type = "manual"
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(
@@ -16203,6 +16813,7 @@ type = "manual"
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         engine.active_runs.insert(run.run_id.clone(), run.clone());
 
@@ -16802,6 +17413,7 @@ type = "manual"
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(
