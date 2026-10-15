@@ -2227,6 +2227,8 @@ fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
 
     let mut cleaned = String::new();
     let mut calls = Vec::new();
+    // Only prose supplies example cues; skipped payloads remain opaque.
+    let mut example_context = String::new();
     let mut last_end = 0;
     let mut cursor = 0;
     while cursor < input.len() {
@@ -2237,6 +2239,7 @@ fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
                 // This format owns its entire line as an argument. Reuse its
                 // admission rule rather than interpreting marker-shaped data.
                 cursor += line.len();
+                example_context.push(' ');
                 continue;
             }
         }
@@ -2246,6 +2249,7 @@ fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
         {
             let span = tools_span(&rest[open.len()..]);
             cursor += open.len() + span.body_end + span.close_len;
+            example_context.push(' ');
             continue;
         }
         if rest
@@ -2264,6 +2268,7 @@ fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
                 break;
             };
             cursor += invoke.end();
+            example_context.push(' ');
             continue;
         }
         if rest.starts_with('{')
@@ -2273,6 +2278,7 @@ fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
             let mut de = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
             if let Some(Ok(_)) = de.next() {
                 cursor += de.byte_offset();
+                example_context.push(' ');
                 continue;
             }
             // An unterminated JSON-looking payload cannot safely expose a
@@ -2300,14 +2306,18 @@ fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
             };
             let before = &input[last_end..cursor];
             cleaned.push_str(before);
-            if !has_example_context(before) {
+            if !has_example_context(&example_context) {
                 calls.extend(parsed);
             }
+            example_context.clear();
             cursor += consumed;
             last_end = cursor;
             continue;
         }
-        cursor += rest.chars().next().map_or(1, char::len_utf8);
+        if let Some(ch) = rest.chars().next() {
+            example_context.push(ch);
+            cursor += ch.len_utf8();
+        }
     }
 
     // Add remaining text after last DSML block
@@ -6124,6 +6134,56 @@ That's how you call it."#;
         );
         assert_eq!(calls[0].name, "file_read");
         assert_eq!(calls[0].arguments["path"], "REQUESTED.md");
+    }
+
+    #[test]
+    fn dsml_example_context_ignores_structured_payloads() {
+        let invocation = "<|DSML| calls><|DSML| invoke name='file_read'><|DSML| parameter name='path' string='true'>REQUESTED.md</|DSML| parameter></|DSML| invoke></|DSML| calls>";
+        let payloads = [
+            r#"<tools>{"name":"file_read","description":"Usage example","parameters":{"type":"object"}}</tools>"#,
+            r#"<tools>{"name":"file_read","description":"Sample usage","parameters":{"type":"object"}}</tools>"#,
+            r#"{"content":"example"}"#,
+            r#"<tool_call>{"name":"file_write","arguments":{"content":"example"}}</tool_call>"#,
+            r#"<invoke name="file_write"><parameter name="content">example</parameter></invoke>"#,
+            "file_write/content>example <|DSML| calls>",
+        ];
+        for payload in payloads {
+            let input = format!("{payload}\n{invocation}");
+            let (text, calls) = extract_dsml_blocks(&input);
+            assert_eq!(calls.len(), 1, "payload suppressed a real call: {payload}");
+            assert_eq!(calls[0].name, "file_read");
+            assert_eq!(calls[0].arguments["path"], "REQUESTED.md");
+            assert_eq!(text.trim_end(), payload);
+
+            for input in [
+                format!("Here is an example:\n{payload}\n{invocation}"),
+                format!("{payload}\nHere is an example:\n{invocation}"),
+            ] {
+                let (_, calls) = extract_dsml_blocks(&input);
+                assert!(calls.is_empty(), "teaching prose was ignored: {input}");
+            }
+        }
+
+        // Exercise the reported declaration case through the public entry point.
+        let (_, calls) = parse_tool_calls(&format!("{}\n{invocation}", payloads[0]));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["path"], "REQUESTED.md");
+    }
+
+    #[test]
+    fn dsml_example_context_does_not_join_prose_across_payloads() {
+        let invocation = "<|DSML| calls><|DSML| invoke name='file_read'><|DSML| parameter name='path' string='true'>REQUESTED.md</|DSML| parameter></|DSML| invoke></|DSML| calls>";
+        for payload in [
+            r#"{"x":1}"#,
+            r#"<tools>{"name":"file_read"}</tools>"#,
+            r#"<invoke name="file_write"><parameter name="content">data</parameter></invoke>"#,
+        ] {
+            let input = format!("ex{payload}ample\n{invocation}");
+            let (text, calls) = extract_dsml_blocks(&input);
+            assert_eq!(calls.len(), 1, "payload joined separate prose: {payload}");
+            assert_eq!(calls[0].arguments["path"], "REQUESTED.md");
+            assert_eq!(text, format!("ex{payload}ample\n"));
+        }
     }
 
     /// BLOCKER 2: DSML string="true" parameters must preserve raw value.
